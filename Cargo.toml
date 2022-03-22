@@ -1,0 +1,23 @@
+[package]
+name = "spx"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1.0.56"
+hyper = { version = "0.14.17", features = ["http1", "http2", "client", "server"] }
+log = "0.4.16"
+pretty_env_logger = "0.4.0"
+regex = "1.5.5"
+serde_regex = "1.1.0"
+rustls-pemfile = "0.3.0"
+serde = { version = "1.0.136", features = ["derive"] }
+tokio = { version = "1.17.0", features = ["rt-multi-thread", "net", "time"] }
+tokio-rustls = "0.23.3"
+toml = "0.5.8"
+trust-dns-resolver = { version = "0.21.1", features = [] }
+
+[profile.release]
+codegen-units = 1
+lto = true
