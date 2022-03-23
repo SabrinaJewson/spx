@@ -31,8 +31,8 @@ pub(crate) fn read(file: &str) -> anyhow::Result<server::Config> {
         proxy: proxy::Config {
             domain: config.proxy.domain,
             resolver: match config.proxy.resolver {
-                Resolver::System => proxy::ResolverConfig::System,
-                Resolver::TrustDns(config) => proxy::ResolverConfig::TrustDns(config),
+                Resolver::System => proxy::resolver::Config::System,
+                Resolver::TrustDns(config) => proxy::resolver::Config::TrustDns(config),
             },
             deny_user_agents: config.proxy.deny_user_agents,
         },

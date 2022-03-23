@@ -1,5 +1,4 @@
 use ::{
-    anyhow::Context as _,
     hyper::http::{self, Uri},
     regex::Regex,
     std::{
@@ -13,19 +12,14 @@ use ::{
         sync::Arc,
         task::{self, Poll},
     },
-    tokio::net::{self, TcpStream},
+    tokio::net::TcpStream,
     tower_service::Service,
 };
 
 pub(crate) struct Config {
     pub(crate) domain: String,
-    pub(crate) resolver: ResolverConfig,
+    pub(crate) resolver: resolver::Config,
     pub(crate) deny_user_agents: Regex,
-}
-
-pub(crate) enum ResolverConfig {
-    System,
-    TrustDns(trust_dns_resolver::config::ResolverConfig),
 }
 
 #[derive(Clone)]
@@ -41,19 +35,9 @@ struct ProxyInner {
 
 impl Proxy {
     pub(crate) fn new(config: Config) -> anyhow::Result<Self> {
-        let resolver = match config.resolver {
-            ResolverConfig::System => Resolver::System,
-            ResolverConfig::TrustDns(config) => {
-                let resolver = trust_dns_resolver::AsyncResolver::tokio(
-                    config,
-                    trust_dns_resolver::config::ResolverOpts::default(),
-                )
-                .context("failed to create DNS resolver")?;
-                Resolver::TrustDns(Arc::new(resolver))
-            }
+        let http_connector = Connector {
+            resolver: Resolver::new(config.resolver)?,
         };
-
-        let http_connector = Connector { resolver };
 
         let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -93,12 +77,6 @@ struct Connector {
     resolver: Resolver,
 }
 
-#[derive(Clone)]
-enum Resolver {
-    System,
-    TrustDns(Arc<trust_dns_resolver::TokioAsyncResolver>),
-}
-
 impl Service<Uri> for Connector {
     type Response = TcpStream;
     type Error = ConnectorError;
@@ -116,22 +94,18 @@ impl Service<Uri> for Connector {
                 Some("https") => 443,
                 _ => 80,
             });
-            let addresses: Vec<_> = match this.resolver {
-                Resolver::System => net::lookup_host(host)
-                    .await
-                    .map_err(ConnectorError::SystemDns)?
-                    .collect(),
-                Resolver::TrustDns(resolver) => resolver
-                    .lookup_ip(host)
-                    .await
-                    .map_err(ConnectorError::TrustDns)?
-                    .iter()
-                    .map(|ip| SocketAddr::new(ip, port))
-                    .collect(),
-            };
+
+            let addresses: Vec<_> = this
+                .resolver
+                .resolve(host)
+                .await
+                .map_err(ConnectorError::Dns)?
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect();
+
             TcpStream::connect(&*addresses)
                 .await
-                .map_err(ConnectorError::ConnectError)
+                .map_err(ConnectorError::Tcp)
         })
     }
 }
@@ -139,29 +113,26 @@ impl Service<Uri> for Connector {
 #[derive(Debug)]
 enum ConnectorError {
     NoHost(NoHostError),
-    SystemDns(io::Error),
-    TrustDns(trust_dns_resolver::error::ResolveError),
-    ConnectError(io::Error),
+    Dns(resolver::Error),
+    Tcp(io::Error),
+}
+
+impl Display for ConnectorError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("failed to connect to URI")
+    }
 }
 
 impl Error for ConnectorError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(match self {
             Self::NoHost(e) => e,
-            Self::SystemDns(e) | Self::ConnectError(e) => e,
-            Self::TrustDns(e) => e,
+            Self::Dns(e) => e,
+            Self::Tcp(e) => e,
         })
     }
 }
 
-impl Display for ConnectorError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // TODO: better messages
-        f.write_str("failed to connect to URI")
-    }
-}
-
-/// Failed to resolve DNS because there was no host.
 #[derive(Debug)]
 struct NoHostError;
 
@@ -172,3 +143,104 @@ impl Display for NoHostError {
 }
 
 impl Error for NoHostError {}
+
+pub(crate) mod resolver {
+    use ::{
+        anyhow::Context as _,
+        std::{
+            error::Error as StdError,
+            fmt::{self, Display, Formatter},
+            io,
+            net::IpAddr,
+            sync::Arc,
+        },
+        tokio::net,
+    };
+
+    pub(crate) enum Config {
+        System,
+        TrustDns(trust_dns_resolver::config::ResolverConfig),
+    }
+
+    #[derive(Clone)]
+    pub(super) enum Resolver {
+        System,
+        TrustDns(Arc<trust_dns_resolver::TokioAsyncResolver>),
+    }
+
+    impl Resolver {
+        pub(super) fn new(config: Config) -> anyhow::Result<Self> {
+            Ok(match config {
+                Config::System => Self::System,
+                Config::TrustDns(config) => {
+                    let resolver = trust_dns_resolver::AsyncResolver::tokio(
+                        config,
+                        trust_dns_resolver::config::ResolverOpts::default(),
+                    )
+                    .context("failed to create DNS resolver")?;
+                    Self::TrustDns(Arc::new(resolver))
+                }
+            })
+        }
+    }
+
+    impl Resolver {
+        pub(super) async fn resolve<'a>(
+            &self,
+            host: &'a str,
+        ) -> Result<impl Iterator<Item = IpAddr> + 'a, Error> {
+            enum Either<A, B> {
+                A(A),
+                B(B),
+            }
+
+            impl<Item, A: Iterator<Item = Item>, B: Iterator<Item = Item>> Iterator for Either<A, B> {
+                type Item = Item;
+                fn next(&mut self) -> Option<Self::Item> {
+                    match self {
+                        Self::A(a) => a.next(),
+                        Self::B(b) => b.next(),
+                    }
+                }
+            }
+
+            Ok(match self {
+                Self::System => Either::A(
+                    net::lookup_host(host)
+                        .await
+                        .map_err(Error::System)?
+                        .map(|addr| addr.ip()),
+                ),
+                Self::TrustDns(resolver) => Either::B(
+                    resolver
+                        .lookup_ip(host)
+                        .await
+                        .map_err(Error::TrustDns)?
+                        .into_iter(),
+                ),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) enum Error {
+        System(io::Error),
+        TrustDns(trust_dns_resolver::error::ResolveError),
+    }
+
+    impl Display for Error {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("failed to resolve DNS name")
+        }
+    }
+
+    impl StdError for Error {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(match self {
+                Self::System(e) => e,
+                Self::TrustDns(e) => e,
+            })
+        }
+    }
+}
+use resolver::Resolver;
